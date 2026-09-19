@@ -26,7 +26,7 @@ moonlight-common-sys = { path = "./moonlight-common-sys", features = [
 # is already Info in both binaries, so behavior is unchanged.
 log = { version = "0.4.28", features = ["release_max_level_info"] }
 simplelog = "0.12.2"
-printf-compat = { version = "0.2.1" }
+printf-compat = { version = "0.4.0" }
 
 # Util
 slab = "0.4.10"
