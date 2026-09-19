@@ -40,6 +40,7 @@ bytes = "1.10.1"
 
 # Http / Https
 reqwest = { version = "0.12.23", default-features = false }
+rustls = { version = "0.23.29", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 uuid = { version = "1.17.0" }
 hex = { version = "0.4.3" }
 url = { version = "2.5.4" }

@@ -2469,6 +2469,7 @@ dependencies = [
  "printf-compat",
  "reqwest",
  "roxmltree",
+ "rustls",
  "serde",
  "thiserror 2.0.16",
  "tokio",
@@ -3379,6 +3380,7 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -3386,6 +3388,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "tower",
  "tower-http",
  "tower-service",
@@ -3500,6 +3503,7 @@ version = "0.23.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2491382039b29b9b11ff08b76ff6c97cf287671dbb74f0be44bda389fffe9bd1"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
