@@ -235,7 +235,10 @@ impl MoonlightStream {
 
         let features = unsafe { LiGetHostFeatureFlags() };
 
-        Ok(HostFeatures::from_bits(features).expect("valid host feature flags"))
+        // Some hosts (e.g. Sunshine forks) advertise feature bits this build of
+        // moonlight-common-c does not know about. Unknown bits are simply not
+        // features we can use, so truncate instead of panicking on them.
+        Ok(HostFeatures::from_bits_truncate(features))
     }
 
     /// This function returns an estimate of the current RTT to the host PC obtained via ENet
