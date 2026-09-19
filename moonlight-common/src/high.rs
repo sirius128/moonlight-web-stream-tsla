@@ -227,6 +227,13 @@ where
         Ok(info.local_ip.as_str())
     }
 
+    /// The pair status reported by the host. When pairing info is set, this comes from the
+    /// authenticated HTTPS request, so it also confirms the host's pinned certificate.
+    pub async fn pair_status(&mut self) -> Result<PairStatus, HostError<C::Error>> {
+        let info = self.host_info().await?;
+        Ok(info.pair_status)
+    }
+
     pub async fn current_game(&mut self) -> Result<u32, HostError<C::Error>> {
         let info = self.host_info().await?;
         Ok(info.current_game)

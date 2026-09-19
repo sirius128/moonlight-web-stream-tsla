@@ -169,8 +169,25 @@ async fn main() {
         })
         .await;
 
-    // Try to use localhost if Sunshine is reachable locally (avoids DNS + NAT hairpin)
-    let host_address = match try_localhost(host_http_port).await {
+    let client_auth = ClientAuth {
+        private_key: Pem::from_str(&client_private_key_pem)
+            .expect("failed to parse client private key"),
+        certificate: Pem::from_str(&client_certificate_pem)
+            .expect("failed to parse client certificate"),
+    };
+    let server_certificate =
+        Pem::from_str(&server_certificate_pem).expect("failed to parse server certificate");
+
+    // Try to use localhost if the local Sunshine is the paired host (avoids DNS + NAT hairpin)
+    let host_address = match try_localhost(
+        &host_address,
+        host_http_port,
+        host_unique_id.as_deref(),
+        &client_auth,
+        &server_certificate,
+    )
+    .await
+    {
         Some(local) => {
             info!("[Stream] Using local address {local} instead of {host_address}");
             // Loopback has no path-MTU concern, so use the standard Moonlight
@@ -193,16 +210,8 @@ async fn main() {
     let mut host = ReqwestMoonlightHost::new(host_address, host_http_port, host_unique_id)
         .expect("failed to create host");
 
-    host.set_pairing_info(
-        &ClientAuth {
-            private_key: Pem::from_str(&client_private_key_pem)
-                .expect("failed to parse client private key"),
-            certificate: Pem::from_str(&client_certificate_pem)
-                .expect("failed to parse client certificate"),
-        },
-        &Pem::from_str(&server_certificate_pem).expect("failed to parse server certificate"),
-    )
-    .expect("failed to set pairing info");
+    host.set_pairing_info(&client_auth, &server_certificate)
+        .expect("failed to set pairing info");
 
     // -- Configure moonlight
     let moonlight = MoonlightInstance::global().expect("failed to find moonlight");
@@ -1186,21 +1195,60 @@ impl StreamConnection {
     }
 }
 
-/// Probe whether Sunshine is reachable on localhost (same machine) or LAN address.
-/// Returns the working local address if found, or None to fall back to the configured address.
-/// Uses a very short timeout so this adds negligible delay when Sunshine is remote.
-async fn try_localhost(http_port: u16) -> Option<String> {
-    use std::time::Duration;
+/// Probe whether the paired host is the Sunshine running on this machine.
+/// Returns the loopback address if so, or None to fall back to the configured address.
+///
+/// A Sunshine answering on localhost is not necessarily the selected host: when this
+/// machine also runs Sunshine and the stream targets another PC, redirecting would
+/// present that PC's client certificate to the local Sunshine, which rejects it.
+/// So an authenticated request pinned to the host's server certificate must succeed.
+async fn try_localhost(
+    host_address: &str,
+    http_port: u16,
+    unique_id: Option<&str>,
+    client_auth: &ClientAuth,
+    server_certificate: &Pem,
+) -> Option<String> {
+    use moonlight_common::PairStatus;
     use tokio::net::TcpStream;
     use tokio::time::timeout;
 
-    let probe_timeout = Duration::from_millis(100);
+    const LOCALHOST: &str = "127.0.0.1";
 
-    // Try 127.0.0.1 first (same machine)
-    let addr = format!("127.0.0.1:{http_port}");
-    if timeout(probe_timeout, TcpStream::connect(&addr)).await.ok()?.is_ok() {
-        return Some("127.0.0.1".to_string());
+    if host_address == LOCALHOST || host_address.eq_ignore_ascii_case("localhost") {
+        return Some(LOCALHOST.to_string());
     }
 
-    None
+    // Cheap reachability check first so a machine without Sunshine adds negligible delay
+    let addr = format!("{LOCALHOST}:{http_port}");
+    if !timeout(Duration::from_millis(100), TcpStream::connect(&addr))
+        .await
+        .ok()?
+        .is_ok()
+    {
+        return None;
+    }
+
+    let mut local_host = ReqwestMoonlightHost::new(
+        LOCALHOST.to_string(),
+        http_port,
+        unique_id.map(str::to_string),
+    )
+    .ok()?;
+    local_host
+        .set_pairing_info(client_auth, server_certificate)
+        .ok()?;
+
+    // With pairing info set, this is answered over HTTPS with the pinned certificate
+    match local_host.pair_status().await {
+        Ok(PairStatus::Paired) => Some(LOCALHOST.to_string()),
+        Ok(status) => {
+            info!("[Stream] Local Sunshine is not the paired host ({status:?}), using {host_address}");
+            None
+        }
+        Err(err) => {
+            info!("[Stream] Local Sunshine is not the paired host ({err}), using {host_address}");
+            None
+        }
+    }
 }
