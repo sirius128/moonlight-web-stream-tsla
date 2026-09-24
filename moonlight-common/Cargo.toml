@@ -28,6 +28,7 @@ form_urlencoded = { workspace = true, optional = true }
 # Network Reqwest backend
 reqwest = { workspace = true, features = ["default"], optional = true }
 bytes = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 
 # High
 tokio = { workspace = true, features = [
@@ -66,6 +67,8 @@ network = [
 backend_reqwest = [
     "dep:reqwest",
     "reqwest/native-tls",
+    "reqwest/rustls-tls-manual-roots-no-provider",
+    "dep:rustls",
     "dep:tokio",
     "dep:bytes",
 ]

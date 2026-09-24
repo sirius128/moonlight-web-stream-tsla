@@ -1,9 +1,18 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use log::debug;
 use pem::Pem;
-use reqwest::{Certificate, Client, ClientBuilder, Identity};
+use reqwest::{Client, ClientBuilder};
+use rustls::{
+    CertificateError, DigitallySignedStruct, SignatureScheme,
+    client::{
+        Resumption,
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    },
+    crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+};
 use thiserror::Error;
 use url::{ParseError, Url};
 
@@ -21,6 +30,8 @@ pub enum ReqwestError {
     Reqwest(#[from] reqwest::Error),
     #[error("{0}")]
     UrlParse(#[from] ParseError),
+    #[error("{0}")]
+    Tls(#[from] rustls::Error),
 }
 pub type ReqwestApiError = ApiError<ReqwestError>;
 
@@ -36,25 +47,109 @@ fn timeout_builder() -> ClientBuilder {
     default_builder().timeout(Duration::from_secs(2))
 }
 
+// Paired hosts are reached with rustls rather than native-tls. On Windows,
+// native-tls imports the client private key into a persisted CryptoAPI key
+// container named "native-tls-<n>", where <n> is a per-process counter
+// starting at 0. web-server and every streamer process therefore write to the
+// same container names, so starting a stream for one host silently replaced
+// the key web-server used for another host, and all HTTPS requests to that
+// host failed with SEC_E_DECRYPT_FAILURE until web-server was restarted.
+// rustls keeps the key in process memory only.
 fn build_client_with_certificates(
     builder: ClientBuilder,
     client_private_key: &Pem,
     client_certificate: &Pem,
     server_certificate: &Pem,
 ) -> Result<Client, ReqwestError> {
-    let server_cert = Certificate::from_pem(server_certificate.to_string().as_bytes())?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
 
-    let identity = Identity::from_pkcs8_pem(
-        client_certificate.to_string().as_bytes(),
-        client_private_key.to_string().as_bytes(),
-    )?;
+    let client_key = match client_private_key.tag() {
+        "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(client_private_key.contents().to_vec().into()),
+        _ => PrivateKeyDer::Pkcs8(client_private_key.contents().to_vec().into()),
+    };
+    let client_cert = CertificateDer::from(client_certificate.contents().to_vec());
 
-    Ok(builder
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(server_cert)
-        .identity(identity)
-        .danger_accept_invalid_hostnames(true)
-        .build()?)
+    let verifier = PinnedServerCertVerifier {
+        server_certificate: CertificateDer::from(server_certificate.contents().to_vec()),
+        provider: provider.clone(),
+    };
+
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_client_auth_cert(vec![client_cert], client_key)?;
+    // Sunshine (OpenSSL, client certificates required) answers resumption
+    // attempts with an internal_error alert, so always do a full handshake.
+    tls.resumption = Resumption::disabled();
+
+    Ok(builder.use_preconfigured_tls(tls).build()?)
+}
+
+/// Trusts exactly the certificate the host presented during pairing.
+///
+/// Hosts use a self-signed certificate without a matching host name, so the
+/// usual chain and name checks do not apply; pinning the certificate is the
+/// same trust the previous native-tls setup expressed with a single root
+/// certificate and `danger_accept_invalid_hostnames`. Handshake signatures
+/// are still verified against the pinned certificate's key.
+#[derive(Debug)]
+struct PinnedServerCertVerifier {
+    server_certificate: CertificateDer<'static>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.server_certificate.as_ref() {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::UnknownIssuer,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 fn build_url(
