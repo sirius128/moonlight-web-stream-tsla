@@ -87,6 +87,24 @@ impl MoonlightInstance {
         }
     }
 
+    /// Whether the next connection asks the host for high quality audio
+    /// (Sunshine: 512 kbps stereo Opus instead of 96 kbps) regardless of the
+    /// video bitrate. When false, upstream's rule applies (video bitrate of
+    /// 15 Mbps or more). Returns false if the linked moonlight-common-c wasn't
+    /// built from the patched source, in which case upstream's rule always applies.
+    pub fn set_high_quality_audio(&self, enabled: bool) -> bool {
+        let _connection_guard = self
+            .handle
+            .connection_lock
+            .lock()
+            .expect("connection lock poisoned");
+        moonlight_common_sys::set_high_audio_bitrate_threshold(if enabled {
+            0
+        } else {
+            moonlight_common_sys::UPSTREAM_HIGH_AUDIO_BITRATE_THRESHOLD
+        })
+    }
+
     pub fn start_connection(
         &self,
         server_info: ServerInfo,

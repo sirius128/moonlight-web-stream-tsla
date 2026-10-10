@@ -2,6 +2,8 @@ use std::env::var;
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(moonlight_audio_threshold_patched)");
+
     #[cfg(feature = "generate-bindings")]
     generate_bindings();
 
@@ -45,6 +47,7 @@ fn compile_moonlight(allow_vendored: bool) -> Option<(String, PathBuf)> {
 
     // Rerun when changed
     println!("cargo::rerun-if-changed=moonlight-common-c");
+    println!("cargo::rerun-if-env-changed={AUDIO_THRESHOLD_ENV}");
     println!("cargo::rerun-if-env-changed=DEP_OPENSSL_ROOT");
     println!("cargo::rerun-if-env-changed=OPENSSL_ROOT_DIR");
     println!("cargo::rerun-if-env-changed=DEP_OPENSSL_INCLUDE");
@@ -54,8 +57,11 @@ fn compile_moonlight(allow_vendored: bool) -> Option<(String, PathBuf)> {
     println!("cargo::rerun-if-env-changed=OPENSSL_LIB_DIR");
     println!("cargo::rerun-if-env-changed=OPENSSL_CRYPTO_LIBRARY");
 
+    let source_dir = patched_moonlight_source();
+    println!("cargo::rustc-cfg=moonlight_audio_threshold_patched");
+
     // builds into $OUT_DIR
-    let mut config = cmake::Config::new("moonlight-common-c");
+    let mut config = cmake::Config::new(&source_dir);
     config.define("BUILD_SHARED_LIBS", "OFF");
     config.define("CMAKE_TRY_COMPILE_TARGET_TYPE", "STATIC_LIBRARY");
 
@@ -117,6 +123,118 @@ fn compile_moonlight(allow_vendored: bool) -> Option<(String, PathBuf)> {
 
     let profile = config.get_profile().to_string();
     Some((profile, config.build()))
+}
+
+// Sunshine picks 512 kbps stereo Opus only when the RTSP Host it receives is not
+// 0.0.0.0, and moonlight-common-c sends 0.0.0.0 whenever the video bitrate is
+// below HIGH_AUDIO_BITRATE_THRESHOLD (15 Mbps). The Tesla browser can't decode
+// video anywhere near that, so the threshold is turned into a runtime variable
+// (default from AUDIO_THRESHOLD_ENV, 0 = always high quality) that the stream
+// settings can override per session. The submodule itself is left untouched;
+// a patched copy is built from OUT_DIR instead.
+#[cfg(feature = "vendored")]
+const AUDIO_THRESHOLD_ENV: &str = "MOONLIGHT_HIGH_AUDIO_BITRATE_THRESHOLD";
+#[cfg(feature = "vendored")]
+const AUDIO_THRESHOLD_DEFINE: &str = "#define HIGH_AUDIO_BITRATE_THRESHOLD 15000";
+#[cfg(feature = "vendored")]
+const AUDIO_THRESHOLD_VAR: &str = "MlHighAudioBitrateThreshold";
+
+#[cfg(feature = "vendored")]
+fn patched_moonlight_source() -> PathBuf {
+    use std::fs;
+
+    let default_threshold: i32 = match var(AUDIO_THRESHOLD_ENV) {
+        Ok(value) => value.trim().parse().unwrap_or_else(|_| {
+            panic!("{AUDIO_THRESHOLD_ENV} must be an integer (kbps), got {value:?}")
+        }),
+        Err(_) => 0,
+    };
+
+    let out_dir = PathBuf::from(var("OUT_DIR").expect("OUT_DIR"));
+    let dest = out_dir.join("moonlight-common-c-patched");
+    if dest.exists() {
+        fs::remove_dir_all(&dest).expect("failed to clear patched moonlight-common-c copy");
+    }
+    copy_dir_recursive("moonlight-common-c".as_ref(), &dest);
+
+    let header = dest.join("src").join("Limelight-internal.h");
+    let replacement = format!(
+        "extern int {AUDIO_THRESHOLD_VAR};\n#define HIGH_AUDIO_BITRATE_THRESHOLD {AUDIO_THRESHOLD_VAR}"
+    );
+    replace_line(&header, AUDIO_THRESHOLD_DEFINE, &replacement);
+
+    let rtsp = dest.join("src").join("RtspConnection.c");
+    let mut rtsp_source = fs::read_to_string(&rtsp)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", rtsp.display()));
+    if !rtsp_source.contains("HIGH_AUDIO_BITRATE_THRESHOLD") {
+        panic!(
+            "{} no longer references HIGH_AUDIO_BITRATE_THRESHOLD; the high quality audio patch needs updating",
+            rtsp.display()
+        );
+    }
+    rtsp_source.push_str(&format!("\nint {AUDIO_THRESHOLD_VAR} = {default_threshold};\n"));
+    fs::write(&rtsp, rtsp_source)
+        .unwrap_or_else(|err| panic!("failed to write {}: {err}", rtsp.display()));
+
+    dest
+}
+
+#[cfg(feature = "vendored")]
+fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) {
+    use std::fs;
+
+    fs::create_dir_all(dest)
+        .unwrap_or_else(|err| panic!("failed to create {}: {err}", dest.display()));
+    let entries = fs::read_dir(src)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", src.display()));
+    for entry in entries {
+        let entry = entry.expect("failed to read directory entry");
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        let file_type = entry.file_type().expect("failed to read file type");
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to);
+        } else {
+            // fs::copy follows symlinks, so a symlinked file is copied as its target.
+            fs::copy(&from, &to).unwrap_or_else(|err| {
+                panic!("failed to copy {} -> {}: {err}", from.display(), to.display())
+            });
+        }
+    }
+}
+
+/// Replaces the line equal to `target` (ignoring trailing whitespace, so CRLF
+/// and LF checkouts both match). Panics unless exactly one line matches, so an
+/// upstream change can't silently disable the patch.
+#[cfg(feature = "vendored")]
+fn replace_line(path: &std::path::Path, target: &str, replacement: &str) {
+    use std::fs;
+
+    let source = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let mut matches = 0;
+    let mut patched = String::with_capacity(source.len() + replacement.len());
+    for line in source.split_inclusive('\n') {
+        let content = line.trim_end();
+        if content == target {
+            matches += 1;
+            patched.push_str(replacement);
+            patched.push_str(&line[content.len()..]);
+        } else {
+            patched.push_str(line);
+        }
+    }
+    if matches != 1 {
+        panic!(
+            "expected exactly one line `{target}` in {}, found {matches}; the high quality audio patch needs updating",
+            path.display()
+        );
+    }
+    fs::write(path, patched)
+        .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
 }
 
 fn link(compile_info: Option<(String, PathBuf)>, allow_vendored: bool) {

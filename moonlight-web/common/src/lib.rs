@@ -24,6 +24,11 @@ pub struct StreamSettings {
     /// the browser reconstruct single lost packets instantly (no retransmit
     /// round-trip, no added latency) at ~10-15% bandwidth overhead.
     pub video_fec: bool,
+    /// Request high quality audio (Sunshine: 512 kbps stereo Opus) regardless
+    /// of the video bitrate. None keeps the build-time default
+    /// (MOONLIGHT_HIGH_AUDIO_BITRATE_THRESHOLD, see moonlight-common-sys/build.rs).
+    #[serde(default)]
+    pub high_quality_audio: Option<bool>,
 }
 
 pub fn serialize_json<T>(message: &T) -> Option<String>

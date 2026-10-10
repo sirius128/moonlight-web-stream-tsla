@@ -27,6 +27,9 @@ export type StreamSettings = {
     canvasRenderer: boolean
     playAudioLocal: boolean
     keepAudioAlive: boolean
+    /** Ask the host for high quality audio (Sunshine: 512 kbps stereo Opus
+     * instead of 96 kbps) regardless of the video bitrate. */
+    highQualityAudio: boolean
     audioSampleQueueSize: number
     mouseScrollMode: MouseScrollMode
     controllerConfig: ControllerConfig
@@ -83,6 +86,7 @@ export function defaultStreamSettings(): StreamSettings {
         canvasRenderer: true,
         playAudioLocal: false,
         keepAudioAlive: true,
+        highQualityAudio: true,
         audioSampleQueueSize: 1,
         mouseScrollMode: "normal",
         controllerConfig: {
@@ -163,6 +167,7 @@ export class StreamSettingsComponent implements Component {
 
     private playAudioLocal: InputComponent
     private keepAudioAlive: InputComponent
+    private highQualityAudio: InputComponent
     private audioSampleQueueSize: InputComponent
 
     private mouseScrollMode: SelectComponent
@@ -412,6 +417,12 @@ export class StreamSettingsComponent implements Component {
         })
         this.keepAudioAlive.addChangeListener(this.onSettingsChange.bind(this))
         this.keepAudioAlive.mount(audioSection)
+
+        this.highQualityAudio = new InputComponent("highQualityAudio", "checkbox", "High Quality Audio (Opus 512 kbps, ~+0.4 Mbps)", {
+            checked: settings?.highQualityAudio ?? defaultSettings.highQualityAudio
+        })
+        this.highQualityAudio.addChangeListener(this.onSettingsChange.bind(this))
+        this.highQualityAudio.mount(audioSection)
 
         // Audio Sample Queue Size
         this.audioSampleQueueSize = new InputComponent("audioSampleQueueSize", "number", "Audio Sample Queue Size", {
@@ -699,6 +710,7 @@ export class StreamSettingsComponent implements Component {
 
         settings.playAudioLocal = this.playAudioLocal.isChecked()
         settings.keepAudioAlive = this.keepAudioAlive.isChecked()
+        settings.highQualityAudio = this.highQualityAudio.isChecked()
         settings.audioSampleQueueSize = parseInt(this.audioSampleQueueSize.getValue())
 
         settings.mouseScrollMode = this.mouseScrollMode.getValue() as any

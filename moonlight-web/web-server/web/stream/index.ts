@@ -211,6 +211,7 @@ export class Stream {
                 video_colorspace: "Rec709", // TODO <---
                 video_color_range_full: true, // TODO <---
                 video_fec: this.settings.videoFec,
+                high_quality_audio: this.settings.highQualityAudio,
             }
         }
 
