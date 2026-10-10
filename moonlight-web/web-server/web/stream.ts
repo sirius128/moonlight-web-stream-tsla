@@ -533,6 +533,11 @@ class ViewerApp implements Component {
             canvas: this.canvasRenderer?.getWorkerDiagnostics() ?? null,
             canvasRendererEnabled: this.settings.canvasRenderer,
             workersAllowedBySettings: this.settings.useVideoWorker,
+            display: {
+                devicePixelRatio: window.devicePixelRatio || 1,
+                cssWidth: this.getElement().clientWidth,
+                cssHeight: this.getElement().clientHeight,
+            },
         }
     }
 

@@ -29,6 +29,13 @@ export type WorkerStatsMessage = {
     srcMinGapMs: number
     srcAvgGapMs: number
     srcMaxGapMs: number
+    /** canvas draw buffer, last frame, and the size the frame is drawn at (px) */
+    bufferWidth: number
+    bufferHeight: number
+    frameWidth: number
+    frameHeight: number
+    drawWidth: number
+    drawHeight: number
 }
 
 let canvas: OffscreenCanvas | null = null
@@ -40,6 +47,9 @@ let drawWidth = 0
 let drawHeight = 0
 let offsetX = 0
 let offsetY = 0
+// Frame size at the last layout pass (stats only)
+let lastFrameWidth = 0
+let lastFrameHeight = 0
 // Scratch surface used only in non-stretch (letterbox/pillarbox) mode with the
 // bitmap renderer — see startBitmapCreationIfIdle() for why this is needed.
 let letterboxCanvas: OffscreenCanvas | null = null
@@ -319,6 +329,7 @@ const statsMsg: WorkerStatsMessage = {
     type: "stats", drawn: 0, dropped: 0, arrived: 0,
     minGapMs: -1, avgGapMs: -1, maxGapMs: -1,
     srcMinGapMs: -1, srcAvgGapMs: -1, srcMaxGapMs: -1,
+    bufferWidth: 0, bufferHeight: 0, frameWidth: 0, frameHeight: 0, drawWidth: 0, drawHeight: 0,
 }
 
 // Post stats back to main thread every 2s (matches overlay refresh; reduces GC pressure)
@@ -333,6 +344,12 @@ setInterval(() => {
     statsMsg.srcMinGapMs = srcGapCount > 0 ? srcGapMin : -1
     statsMsg.srcAvgGapMs = srcGapCount > 0 ? srcGapSum / srcGapCount : -1
     statsMsg.srcMaxGapMs = srcGapCount > 0 ? srcGapMax : -1
+    statsMsg.bufferWidth = canvas?.width ?? 0
+    statsMsg.bufferHeight = canvas?.height ?? 0
+    statsMsg.frameWidth = lastFrameWidth
+    statsMsg.frameHeight = lastFrameHeight
+    statsMsg.drawWidth = drawWidth
+    statsMsg.drawHeight = drawHeight
     workerSelf.postMessage(statsMsg)
     // Reset interval accumulators
     arrivalCount = 0
@@ -356,6 +373,8 @@ function recalcForFrame(frame: VideoFrame) {
     const safeDisplayHeight = Math.max(1, frame.displayHeight)
     const canvasAspect = canvas.width / safeHeight
     const frameAspect = frame.displayWidth / safeDisplayHeight
+    lastFrameWidth = frame.displayWidth
+    lastFrameHeight = frame.displayHeight
 
     offsetX = 0
     offsetY = 0

@@ -3,6 +3,16 @@ declare class MediaStreamTrackProcessor {
     readonly readable: ReadableStream<VideoFrame>
 }
 
+/** Sizes in pixels along the decode→draw path; 0 = not known yet. */
+export type RenderGeometry = {
+    bufferWidth: number
+    bufferHeight: number
+    frameWidth: number
+    frameHeight: number
+    drawWidth: number
+    drawHeight: number
+}
+
 export class CanvasRenderer {
     canvas: HTMLCanvasElement | null
     ctx: CanvasRenderingContext2D | null
@@ -131,6 +141,14 @@ export class CanvasRenderer {
                     this.workerMinGapMs          = event.data.minGapMs
                     this.workerAvgGapMs          = event.data.avgGapMs
                     this.workerMaxGapMs          = event.data.maxGapMs
+                    this.workerGeometry = {
+                        bufferWidth:  event.data.bufferWidth,
+                        bufferHeight: event.data.bufferHeight,
+                        frameWidth:   event.data.frameWidth,
+                        frameHeight:  event.data.frameHeight,
+                        drawWidth:    event.data.drawWidth,
+                        drawHeight:   event.data.drawHeight,
+                    }
                 }
             }
             this.renderWorker.postMessage({
@@ -199,6 +217,18 @@ export class CanvasRenderer {
             drawOnArrival:   this.drawOnArrival,
             usingBitmapRenderer: this.bitmapCtx != null,
             videoElementMode: isVideoElementActive,
+            geometry: isWorkerActive ? this.workerGeometry : this.mainGeometry(),
+        }
+    }
+
+    private mainGeometry(): RenderGeometry {
+        return {
+            bufferWidth:  this.offscreenCanvas?.width ?? this.canvas?.width ?? 0,
+            bufferHeight: this.offscreenCanvas?.height ?? this.canvas?.height ?? 0,
+            frameWidth:   this.lastFrameWidth,
+            frameHeight:  this.lastFrameHeight,
+            drawWidth:    this.drawWidth,
+            drawHeight:   this.drawHeight,
         }
     }
 
@@ -721,6 +751,12 @@ export class CanvasRenderer {
     private workerMinGapMs: number = -1;
     private workerAvgGapMs: number = -1;
     private workerMaxGapMs: number = -1;
+    private workerGeometry: RenderGeometry = {
+        bufferWidth: 0, bufferHeight: 0, frameWidth: 0, frameHeight: 0, drawWidth: 0, drawHeight: 0,
+    };
+    // Frame size seen by the main-thread path at its last layout pass
+    private lastFrameWidth: number = 0;
+    private lastFrameHeight: number = 0;
     // Last state requested via setStatsEnabled(), replayed once the worker
     // actually exists — the stats overlay's initial show() typically fires
     // before startRendering() has created renderWorker, so a plain postMessage
@@ -765,6 +801,8 @@ export class CanvasRenderer {
         const h = this.canvas.clientHeight
         const canvasAspect = w / h
         const frameAspect = frame.displayWidth / frame.displayHeight
+        this.lastFrameWidth = frame.displayWidth
+        this.lastFrameHeight = frame.displayHeight
 
         this.resizeDrawTarget(w, h)
         this.offsetX = 0
