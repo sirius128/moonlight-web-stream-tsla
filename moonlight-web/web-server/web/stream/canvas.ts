@@ -3,6 +3,10 @@ declare class MediaStreamTrackProcessor {
     readonly readable: ReadableStream<VideoFrame>
 }
 
+// A frame this close to the draw buffer in both dimensions is copied 1:1 and
+// the buffer resized to match, rather than resampled by a pixel or two.
+const SNAP_PX = 2
+
 /** Sizes in pixels along the decode→draw path; 0 = not known yet. */
 export type RenderGeometry = {
     bufferWidth: number
@@ -75,42 +79,68 @@ export class CanvasRenderer {
         this.handleResize = () => {
             if (!this.canvas) return
             if (this.workerRenderingEnabled && this.renderWorker) {
-                this.renderWorker.postMessage({
-                    type: "resize",
-                    width: Math.max(1, this.canvas.clientWidth),
-                    height: Math.max(1, this.canvas.clientHeight),
-                })
+                const [width, height] = this.targetBufferSize()
+                this.renderWorker.postMessage({ type: "resize", width, height })
                 return
             }
 
-            if (this.useVideoElementSource) {
-                // Reset layout so it recalculates on next draw
-                this.drawWidth = 0
-                this.drawHeight = 0
-                return
-            }
-
-            if (this.stretchToFit) {
-                const w = this.canvas.clientWidth
-                const h = this.canvas.clientHeight
-                this.resizeDrawTarget(w, h)
-                this.drawWidth = w
-                this.drawHeight = h
-                this.offsetX = 0
-                this.offsetY = 0
-            } else {
-                // For non-stretch mode we need the next video frame to recalc sizes
-                this.drawWidth = 0
-                this.drawHeight = 0
-            }
+            // Relayout against the new size on the next frame (the buffer
+            // size depends on the frame size too — see onFirstFrameAfterResize)
+            this.drawWidth = 0
+            this.drawHeight = 0
         }
         window.addEventListener("resize", this.handleResize)
         // Belt-and-suspenders alongside the window "resize" listener above:
         // covers layout changes that resize the canvas's CSS box without
         // firing a window resize event (e.g. embedded-browser viewport
         // quirks). handleResize() is idempotent/cheap to call redundantly.
-        this.resizeObserver = new ResizeObserver(this.handleResize)
-        this.resizeObserver.observe(this.canvas)
+        // device-pixel-content-box gives the exact device pixel size the
+        // compositor uses (no rounding guesswork) and also fires when only
+        // the device pixel ratio changes.
+        this.resizeObserver = new ResizeObserver((entries) => {
+            const box = entries[entries.length - 1]?.devicePixelContentBoxSize?.[0]
+            if (box) {
+                this.devicePixelBoxSize = [Math.round(box.inlineSize), Math.round(box.blockSize)]
+            }
+            this.handleResize()
+        })
+        try {
+            this.resizeObserver.observe(this.canvas, { box: "device-pixel-content-box" })
+        } catch (_e) {
+            this.resizeObserver.observe(this.canvas)
+        }
+        this.watchDevicePixelRatio()
+    }
+
+    // Exact device pixel size of the canvas box from ResizeObserver, when the
+    // browser supports device-pixel-content-box
+    private devicePixelBoxSize: [number, number] | null = null
+    private dprQuery: MediaQueryList | null = null
+    // Needed when device-pixel-content-box is unsupported; where it is
+    // supported the ResizeObserver also fires and refreshes the exact size.
+    private onDevicePixelRatioChange = () => {
+        this.watchDevicePixelRatio()
+        this.handleResize()
+    }
+
+    // A resolution media query only matches one DPR, so re-arm it on change.
+    private watchDevicePixelRatio() {
+        this.dprQuery?.removeEventListener("change", this.onDevicePixelRatioChange)
+        this.dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`)
+        this.dprQuery.addEventListener("change", this.onDevicePixelRatioChange)
+    }
+
+    /** Draw buffer size in device pixels, so one buffer pixel maps to one
+     * panel pixel instead of being upscaled by the compositor. */
+    private targetBufferSize(): [number, number] {
+        if (this.devicePixelBoxSize) {
+            return [Math.max(1, this.devicePixelBoxSize[0]), Math.max(1, this.devicePixelBoxSize[1])]
+        }
+        const dpr = window.devicePixelRatio || 1
+        return [
+            Math.max(1, Math.round((this.canvas?.clientWidth ?? 0) * dpr)),
+            Math.max(1, Math.round((this.canvas?.clientHeight ?? 0) * dpr)),
+        ]
     }
 
     private trySetupRenderWorker() {
@@ -151,12 +181,13 @@ export class CanvasRenderer {
                     }
                 }
             }
+            const [width, height] = this.targetBufferSize()
             this.renderWorker.postMessage({
                 type: "init",
                 canvas: offscreen,
                 stretchToFit: this.stretchToFit,
-                width: Math.max(1, this.canvas.clientWidth),
-                height: Math.max(1, this.canvas.clientHeight),
+                width,
+                height,
             }, [offscreen as any])
             if (this.statsEnabledDesired) {
                 this.renderWorker.postMessage({ type: 'enable-stats' })
@@ -553,7 +584,7 @@ export class CanvasRenderer {
         const frame = this.latestFrame
         if (!frame || this.latestFrameDrawn) return
 
-        if (this.drawWidth === 0) {
+        if (this.drawWidth === 0 || frame.displayWidth !== this.lastFrameWidth || frame.displayHeight !== this.lastFrameHeight) {
             this.onFirstFrameAfterResize(frame)
         }
 
@@ -667,11 +698,14 @@ export class CanvasRenderer {
             return
         }
 
-        createImageBitmap(frame, {
-            resizeWidth: this.drawWidth,
-            resizeHeight: this.drawHeight,
-            resizeQuality: "low",
-        }).then((bitmap) => {
+        const bitmapPromise = frame.displayWidth === this.drawWidth && frame.displayHeight === this.drawHeight
+            ? createImageBitmap(frame)
+            : createImageBitmap(frame, {
+                resizeWidth: this.drawWidth,
+                resizeHeight: this.drawHeight,
+                resizeQuality: "low",
+            })
+        bitmapPromise.then((bitmap) => {
             this.bitmapCtx?.transferFromImageBitmap(bitmap)
             bitmap.close()
             frame.close()
@@ -786,19 +820,21 @@ export class CanvasRenderer {
         }
     }
 
-    // draw target (canvas.width/height, or the offscreen equivalent) always
-    // tracks the CSS box size (clientWidth/clientHeight), never the frame's
-    // own resolution — in both stretch and non-stretch mode. Previously the
-    // non-stretch branch resized the draw target to the frame's own
-    // dimensions, which makes canvasAspect equal frameAspect by construction,
-    // so offsetX/offsetY always computed to exactly 0 — letterboxing silently
-    // never applied, and a later viewport resize (without a frame resolution
-    // change) had nothing to correct the picture back to the right aspect
-    // ratio.
+    // draw target (canvas.width/height, or the offscreen equivalent) tracks
+    // the canvas box in device pixels (targetBufferSize), never the frame's
+    // own resolution — in both stretch and non-stretch mode. Sizing it to the
+    // frame makes canvasAspect equal frameAspect by construction, so the
+    // letterbox offsets always come out as 0. The one exception is a frame
+    // within SNAP_PX of the box (native resolution rounded to even values for
+    // the encoder): the buffer takes the frame's size so the frame is copied
+    // 1:1 instead of being resampled by a pixel.
     public onFirstFrameAfterResize(frame: VideoFrame) {
         if(!this.canvas) return
-        const w = this.canvas.clientWidth
-        const h = this.canvas.clientHeight
+        let [w, h] = this.targetBufferSize()
+        if (Math.abs(frame.displayWidth - w) <= SNAP_PX && Math.abs(frame.displayHeight - h) <= SNAP_PX) {
+            w = frame.displayWidth
+            h = frame.displayHeight
+        }
         const canvasAspect = w / h
         const frameAspect = frame.displayWidth / frame.displayHeight
         this.lastFrameWidth = frame.displayWidth
@@ -862,6 +898,8 @@ export class CanvasRenderer {
             this.resizeObserver.disconnect()
             this.resizeObserver = null
         }
+        this.dprQuery?.removeEventListener("change", this.onDevicePixelRatioChange)
+        this.dprQuery = null
         if (this.hiddenVideo) {
             this.hiddenVideo.pause()
             this.hiddenVideo.srcObject = null

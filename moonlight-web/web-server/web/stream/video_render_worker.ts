@@ -47,9 +47,15 @@ let drawWidth = 0
 let drawHeight = 0
 let offsetX = 0
 let offsetY = 0
-// Frame size at the last layout pass (stats only)
+// Frame size at the last layout pass; a change triggers a relayout
 let lastFrameWidth = 0
 let lastFrameHeight = 0
+// Canvas box size in device pixels, as reported by the main thread
+let targetWidth = 1
+let targetHeight = 1
+// A frame this close to the target in both dimensions is copied 1:1 and the
+// buffer resized to match, rather than resampled by a pixel or two.
+const SNAP_PX = 2
 // Scratch surface used only in non-stretch (letterbox/pillarbox) mode with the
 // bitmap renderer — see startBitmapCreationIfIdle() for why this is needed.
 let letterboxCanvas: OffscreenCanvas | null = null
@@ -203,7 +209,7 @@ function startBitmapCreationIfIdle() {
     if (bitmapCreationInFlight || !pendingRawFrame || !bitmapCtx || !canvas) return
     const frame = pendingRawFrame
     pendingRawFrame = null
-    if (drawWidth === 0 || drawHeight === 0) {
+    if (needsLayout(frame)) {
         recalcForFrame(frame)
     }
     bitmapCreationInFlight = true
@@ -245,11 +251,14 @@ function startBitmapCreationIfIdle() {
         return
     }
 
-    createImageBitmap(frame, {
-        resizeWidth: drawWidth,
-        resizeHeight: drawHeight,
-        resizeQuality: "low",
-    }).then((bitmap) => {
+    const bitmapPromise = frame.displayWidth === drawWidth && frame.displayHeight === drawHeight
+        ? createImageBitmap(frame)
+        : createImageBitmap(frame, {
+            resizeWidth: drawWidth,
+            resizeHeight: drawHeight,
+            resizeQuality: "low",
+        })
+    bitmapPromise.then((bitmap) => {
         frame.close()
         bitmapCreationInFlight = false
         if (!canvas) {
@@ -357,17 +366,29 @@ setInterval(() => {
     srcGapMin = Infinity; srcGapMax = -Infinity; srcGapSum = 0; srcGapCount = 0
 }, 2000)
 
-// canvas.width/canvas.height always track the viewport/container size (set by
-// the "init" and "resize" messages below) — never the frame's own resolution.
-// Letterbox/pillarbox padding is expressed purely through drawWidth/drawHeight/
-// offsetX/offsetY against that stable size. Previously this function resized
-// canvas.width/height to the frame's own dimensions in non-stretch mode, which
-// made canvasAspect equal frameAspect by construction — offsetX/offsetY always
-// came out to exactly 0, so letterboxing silently never applied and a later
-// viewport resize (without a frame resolution change) had nothing to correct
-// the picture back to the right aspect ratio.
+function needsLayout(frame: VideoFrame): boolean {
+    return drawWidth === 0 || drawHeight === 0 ||
+        frame.displayWidth !== lastFrameWidth || frame.displayHeight !== lastFrameHeight
+}
+
+// canvas.width/canvas.height track the canvas box in device pixels (targetWidth/
+// targetHeight, set by the "init" and "resize" messages) — never the frame's own
+// resolution. Sizing it to the frame makes canvasAspect equal frameAspect by
+// construction, so the letterbox offsets always come out as 0. The one exception
+// is a frame within SNAP_PX of the target (native resolution rounded to even
+// values for the encoder): the buffer takes the frame's size so the frame is
+// copied 1:1 instead of being resampled by a pixel.
 function recalcForFrame(frame: VideoFrame) {
     if (!canvas) return
+
+    let bufferWidth = targetWidth
+    let bufferHeight = targetHeight
+    if (Math.abs(frame.displayWidth - bufferWidth) <= SNAP_PX && Math.abs(frame.displayHeight - bufferHeight) <= SNAP_PX) {
+        bufferWidth = frame.displayWidth
+        bufferHeight = frame.displayHeight
+    }
+    if (canvas.width !== bufferWidth) canvas.width = bufferWidth
+    if (canvas.height !== bufferHeight) canvas.height = bufferHeight
 
     const safeHeight = Math.max(1, canvas.height)
     const safeDisplayHeight = Math.max(1, frame.displayHeight)
@@ -402,7 +423,7 @@ function drawFrame(frame: VideoFrame) {
         return
     }
 
-    if (drawWidth === 0 || drawHeight === 0) {
+    if (needsLayout(frame)) {
         recalcForFrame(frame)
     }
 
@@ -429,8 +450,10 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
     if (data.type === "init") {
         canvas = data.canvas
         stretchToFit = data.stretchToFit
-        canvas.width = Math.max(1, data.width)
-        canvas.height = Math.max(1, data.height)
+        targetWidth = Math.max(1, data.width)
+        targetHeight = Math.max(1, data.height)
+        canvas.width = targetWidth
+        canvas.height = targetHeight
         drawWidth = 0
         drawHeight = 0
         offsetX = 0
@@ -452,20 +475,14 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
 
     if (data.type === "resize") {
         if (!canvas) return
-        // canvas.width/height always track the viewport/container size,
-        // regardless of stretch mode — see the comment on recalcForFrame().
-        canvas.width = Math.max(1, data.width)
-        canvas.height = Math.max(1, data.height)
+        // The buffer is resized on the next frame by recalcForFrame(), which
+        // also needs that frame's size to decide whether to snap to it.
+        targetWidth = Math.max(1, data.width)
+        targetHeight = Math.max(1, data.height)
+        drawWidth = 0
+        drawHeight = 0
         offsetX = 0
         offsetY = 0
-        if (stretchToFit) {
-            drawWidth = canvas.width
-            drawHeight = canvas.height
-        } else {
-            // Force a recompute against the new size on the next frame.
-            drawWidth = 0
-            drawHeight = 0
-        }
         return
     }
 
