@@ -30,6 +30,7 @@ export class CanvasRenderer {
     private workerInitError: string | null = null
     private stretchToFit: boolean
     private handleResize: () => void
+    private resizeObserver: ResizeObserver | null = null
 
     // Hidden video element renderer: uses browser's native frame timing
     private hiddenVideo: HTMLVideoElement | null = null
@@ -94,6 +95,12 @@ export class CanvasRenderer {
             }
         }
         window.addEventListener("resize", this.handleResize)
+        // Belt-and-suspenders alongside the window "resize" listener above:
+        // covers layout changes that resize the canvas's CSS box without
+        // firing a window resize event (e.g. embedded-browser viewport
+        // quirks). handleResize() is idempotent/cheap to call redundantly.
+        this.resizeObserver = new ResizeObserver(this.handleResize)
+        this.resizeObserver.observe(this.canvas)
     }
 
     private trySetupRenderWorker() {
@@ -573,10 +580,13 @@ export class CanvasRenderer {
      * latestFrame and picked up either by the retry below or the next caller
      * — never captured by a second concurrent createImageBitmap call.
      *
-     * Known limitation (matches the worker path): no offsetX/offsetY
-     * compositing — transferFromImageBitmap always fills the whole canvas, so
-     * letterbox/pillarbox positioning isn't applied here. Fine under the
-     * default stretchToFit=true where offsets are always 0.
+     * Non-stretch (letterbox/pillarbox): transferFromImageBitmap() always
+     * presents its bitmap as the entire canvas — it has no independent x/y
+     * placement — so a bitmap resized down to drawWidth/drawHeight alone
+     * would just get stretched back out to fill the canvas. In that case the
+     * frame is first composited onto a full-canvas-sized scratch surface at
+     * (offsetX, offsetY) so the padding bars are baked into the bitmap
+     * itself; see ensureLetterboxCanvas().
      */
     private drawStoredFrameBitmap(frame: VideoFrame) {
         if (!this.bitmapCtx) {
@@ -603,6 +613,30 @@ export class CanvasRenderer {
             // a frame that arrived while this one was in flight.
             this.drawStoredFrame()
         }
+
+        if (this.offsetX !== 0 || this.offsetY !== 0) {
+            const canvasWidth = this.offscreenCanvas ? this.offscreenCanvas.width : (this.canvas?.width ?? 0)
+            const canvasHeight = this.offscreenCanvas ? this.offscreenCanvas.height : (this.canvas?.height ?? 0)
+            const lctx = this.ensureLetterboxCanvas(canvasWidth, canvasHeight)
+            if (!lctx || !this.letterboxCanvas) {
+                frame.close()
+                settle()
+                return
+            }
+            lctx.clearRect(0, 0, canvasWidth, canvasHeight)
+            lctx.drawImage(frame, this.offsetX, this.offsetY, this.drawWidth, this.drawHeight)
+            frame.close()
+            createImageBitmap(this.letterboxCanvas).then((bitmap) => {
+                this.bitmapCtx?.transferFromImageBitmap(bitmap)
+                bitmap.close()
+                this.recordDrawCompletion(arrivedAt)
+                settle()
+            }).catch(() => {
+                settle()
+            })
+            return
+        }
+
         createImageBitmap(frame, {
             resizeWidth: this.drawWidth,
             resizeHeight: this.drawHeight,
@@ -617,6 +651,19 @@ export class CanvasRenderer {
             frame.close()
             settle()
         })
+    }
+
+    // Scratch surface used only in non-stretch (letterbox/pillarbox) mode
+    // with the bitmap renderer — see drawStoredFrameBitmap() for why.
+    private letterboxCanvas: OffscreenCanvas | null = null
+    private letterboxCtx: OffscreenCanvasRenderingContext2D | null = null
+
+    private ensureLetterboxCanvas(width: number, height: number): OffscreenCanvasRenderingContext2D | null {
+        if (!this.letterboxCanvas || this.letterboxCanvas.width !== width || this.letterboxCanvas.height !== height) {
+            this.letterboxCanvas = new OffscreenCanvas(width, height)
+            this.letterboxCtx = this.letterboxCanvas.getContext("2d", { alpha: false })
+        }
+        return this.letterboxCtx
     }
 
     /** Arrival→draw latency + inter-draw gap bookkeeping. */
@@ -703,40 +750,39 @@ export class CanvasRenderer {
         }
     }
 
+    // draw target (canvas.width/height, or the offscreen equivalent) always
+    // tracks the CSS box size (clientWidth/clientHeight), never the frame's
+    // own resolution — in both stretch and non-stretch mode. Previously the
+    // non-stretch branch resized the draw target to the frame's own
+    // dimensions, which makes canvasAspect equal frameAspect by construction,
+    // so offsetX/offsetY always computed to exactly 0 — letterboxing silently
+    // never applied, and a later viewport resize (without a frame resolution
+    // change) had nothing to correct the picture back to the right aspect
+    // ratio.
     public onFirstFrameAfterResize(frame: VideoFrame) {
         if(!this.canvas) return
-        // Calculate aspect ratios
-        const canvasAspect = this.canvas.clientWidth / this.canvas.clientHeight
+        const w = this.canvas.clientWidth
+        const h = this.canvas.clientHeight
+        const canvasAspect = w / h
         const frameAspect = frame.displayWidth / frame.displayHeight
 
-        // Reset offsets to avoid stale values from a previous layout
+        this.resizeDrawTarget(w, h)
         this.offsetX = 0
         this.offsetY = 0
 
         if (this.stretchToFit) {
-            const w = this.canvas.clientWidth
-            const h = this.canvas.clientHeight
-            this.resizeDrawTarget(w, h)
             this.drawWidth = w
             this.drawHeight = h
-            this.offsetX = 0
-            this.offsetY = 0
+        } else if (canvasAspect > frameAspect) {
+            // Canvas is wider than the video frame, so the video will be pillarboxed.
+            this.drawHeight = h
+            this.drawWidth = this.drawHeight * frameAspect
+            this.offsetX = (w - this.drawWidth) / 2
         } else {
-            const w = frame.displayWidth
-            const h = frame.displayHeight
-            this.resizeDrawTarget(w, h)
-
-            if (canvasAspect > frameAspect) {
-                // Canvas is wider than the video frame, so the video will be pillarboxed.
-                this.drawHeight = h
-                this.drawWidth = this.drawHeight * frameAspect
-                this.offsetX = (w - this.drawWidth) / 2
-            } else {
-                // Canvas is taller than the video frame, so the video will be letterboxed.
-                this.drawWidth = w
-                this.drawHeight = this.drawWidth / frameAspect
-                this.offsetY = (h - this.drawHeight) / 2
-            }
+            // Canvas is taller than the video frame, so the video will be letterboxed.
+            this.drawWidth = w
+            this.drawHeight = this.drawWidth / frameAspect
+            this.offsetY = (h - this.drawHeight) / 2
         }
     }
 
@@ -774,6 +820,10 @@ export class CanvasRenderer {
         if (this.handleResize) {
             window.removeEventListener("resize", this.handleResize)
         }
+        if (this.resizeObserver) {
+            this.resizeObserver.disconnect()
+            this.resizeObserver = null
+        }
         if (this.hiddenVideo) {
             this.hiddenVideo.pause()
             this.hiddenVideo.srcObject = null
@@ -784,5 +834,7 @@ export class CanvasRenderer {
         this.ctx = null
         this.bitmapCtx = null
         this.offscreenCanvas = null
+        this.letterboxCanvas = null
+        this.letterboxCtx = null
     }
 }

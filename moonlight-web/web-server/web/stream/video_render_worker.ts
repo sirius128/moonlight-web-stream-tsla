@@ -40,6 +40,10 @@ let drawWidth = 0
 let drawHeight = 0
 let offsetX = 0
 let offsetY = 0
+// Scratch surface used only in non-stretch (letterbox/pillarbox) mode with the
+// bitmap renderer — see startBitmapCreationIfIdle() for why this is needed.
+let letterboxCanvas: OffscreenCanvas | null = null
+let letterboxCtx: OffscreenCanvasRenderingContext2D | null = null
 const workerSelf = self as any
 
 // Active reader when the ReadableStream has been transferred to this worker.
@@ -171,6 +175,16 @@ function scheduleFrame(frame: VideoFrame) {
     }
 }
 
+/** (Re)creates the letterbox scratch canvas if it doesn't match the current
+ * output size. Returns null if a 2D context couldn't be obtained. */
+function ensureLetterboxCanvas(width: number, height: number): OffscreenCanvasRenderingContext2D | null {
+    if (!letterboxCanvas || letterboxCanvas.width !== width || letterboxCanvas.height !== height) {
+        letterboxCanvas = new OffscreenCanvas(width, height)
+        letterboxCtx = letterboxCanvas.getContext("2d", { alpha: false })
+    }
+    return letterboxCtx
+}
+
 /** Starts createImageBitmap() for pendingRawFrame if nothing's already in
  * flight. Called on arrival AND right after the previous call resolves, so
  * decode/resize work stays maximally overlapped with network/vsync timing
@@ -183,6 +197,44 @@ function startBitmapCreationIfIdle() {
         recalcForFrame(frame)
     }
     bitmapCreationInFlight = true
+
+    if (offsetX !== 0 || offsetY !== 0) {
+        // Non-stretch (letterbox/pillarbox): transferFromImageBitmap() always
+        // presents its bitmap as the entire canvas — it has no independent x/y
+        // placement — so a bitmap resized down to drawWidth/drawHeight alone
+        // would just get stretched back out to fill the canvas, destroying the
+        // aspect ratio we just computed. Composite the frame onto a
+        // full-canvas-sized scratch surface at (offsetX, offsetY) first so the
+        // padding bars are baked into the bitmap itself.
+        const lctx = ensureLetterboxCanvas(canvas.width, canvas.height)
+        if (!lctx || !letterboxCanvas) {
+            frame.close()
+            bitmapCreationInFlight = false
+            startBitmapCreationIfIdle()
+            return
+        }
+        lctx.clearRect(0, 0, letterboxCanvas.width, letterboxCanvas.height)
+        lctx.drawImage(frame, offsetX, offsetY, drawWidth, drawHeight)
+        frame.close()
+        createImageBitmap(letterboxCanvas).then((bitmap) => {
+            bitmapCreationInFlight = false
+            if (!canvas) {
+                bitmap.close()
+                return
+            }
+            if (pendingBitmap) {
+                pendingBitmap.close()
+                workerDropped++
+            }
+            pendingBitmap = bitmap
+            startBitmapCreationIfIdle()
+        }).catch(() => {
+            bitmapCreationInFlight = false
+            startBitmapCreationIfIdle()
+        })
+        return
+    }
+
     createImageBitmap(frame, {
         resizeWidth: drawWidth,
         resizeHeight: drawHeight,
@@ -288,6 +340,15 @@ setInterval(() => {
     srcGapMin = Infinity; srcGapMax = -Infinity; srcGapSum = 0; srcGapCount = 0
 }, 2000)
 
+// canvas.width/canvas.height always track the viewport/container size (set by
+// the "init" and "resize" messages below) — never the frame's own resolution.
+// Letterbox/pillarbox padding is expressed purely through drawWidth/drawHeight/
+// offsetX/offsetY against that stable size. Previously this function resized
+// canvas.width/height to the frame's own dimensions in non-stretch mode, which
+// made canvasAspect equal frameAspect by construction — offsetX/offsetY always
+// came out to exactly 0, so letterboxing silently never applied and a later
+// viewport resize (without a frame resolution change) had nothing to correct
+// the picture back to the right aspect ratio.
 function recalcForFrame(frame: VideoFrame) {
     if (!canvas) return
 
@@ -303,12 +364,6 @@ function recalcForFrame(frame: VideoFrame) {
         drawWidth = canvas.width
         drawHeight = canvas.height
         return
-    }
-
-    // Keep source resolution in non-stretch mode.
-    if (drawWidth === 0 || drawHeight === 0) {
-        canvas.width = frame.displayWidth
-        canvas.height = frame.displayHeight
     }
 
     if (canvasAspect > frameAspect) {
@@ -378,18 +433,19 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
 
     if (data.type === "resize") {
         if (!canvas) return
+        // canvas.width/height always track the viewport/container size,
+        // regardless of stretch mode — see the comment on recalcForFrame().
+        canvas.width = Math.max(1, data.width)
+        canvas.height = Math.max(1, data.height)
+        offsetX = 0
+        offsetY = 0
         if (stretchToFit) {
-            canvas.width = Math.max(1, data.width)
-            canvas.height = Math.max(1, data.height)
             drawWidth = canvas.width
             drawHeight = canvas.height
-            offsetX = 0
-            offsetY = 0
         } else {
+            // Force a recompute against the new size on the next frame.
             drawWidth = 0
             drawHeight = 0
-            offsetX = 0
-            offsetY = 0
         }
         return
     }
@@ -432,6 +488,8 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
         lastArrivedTimestamp = -1
         canvas = null
         ctx = null
+        letterboxCanvas = null
+        letterboxCtx = null
     }
 
     if (data.type === "enable-stats") { statsEnabled = true }

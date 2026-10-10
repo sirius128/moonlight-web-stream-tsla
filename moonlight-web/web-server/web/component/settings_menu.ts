@@ -377,8 +377,11 @@ export class StreamSettingsComponent implements Component {
         this.fps.addChangeListener(this.onSettingsChange.bind(this))
         this.fps.mount(basicSection)
 
-        // Bitrate
-        this.bitrate = new InputComponent("bitrate", "number", "Bitrate", {
+        // Bitrate — kbps, video only (host-side Opus audio bitrate isn't
+        // configurable via the Moonlight protocol; see LiStartConnection's
+        // STREAM_CONFIGURATION.bitrate doc comment and streamer/src/sender.rs's
+        // `bitrate * 125` kbps->bytes/sec conversion for where this number is used).
+        this.bitrate = new InputComponent("bitrate", "number", "Bitrate (kbps, video only)", {
             defaultValue: defaultSettings.bitrate.toString(),
             value: settings?.bitrate?.toString(),
             step: "100",
