@@ -607,7 +607,7 @@ Required for building:
 - [openssl-sys](https://docs.rs/openssl-sys/0.9.109/openssl_sys/): For information on building openssl sys go to the [openssl docs](https://docs.rs/openssl/latest/openssl/)
 - A [bindgen installation](https://rust-lang.github.io/rust-bindgen/requirements.html) for generating the bindings to the [moonlight-common-c](https://github.com/moonlight-stream/moonlight-common-c) library
 
-High quality audio: upstream moonlight-common-c only asks the host for high quality audio (Sunshine: 512 kbps stereo Opus instead of 96 kbps) at video bitrates of 15 Mbps or more, which the Tesla browser can't decode. `build.rs` builds a patched copy of the submodule in `OUT_DIR` that turns `HIGH_AUDIO_BITRATE_THRESHOLD` into a runtime value, toggled per stream by the "High Quality Audio" setting. When the client doesn't send the setting, the build-time default from `MOONLIGHT_HIGH_AUDIO_BITRATE_THRESHOLD` (kbps, default `0` = always high quality) applies.
+High quality audio: upstream moonlight-common-c only asks the host for high quality audio (Sunshine: 512 kbps stereo Opus instead of 96 kbps) at video bitrates of 15 Mbps or more. `build.rs` builds a patched copy of the submodule in `OUT_DIR` that turns `HIGH_AUDIO_BITRATE_THRESHOLD` into a runtime value, toggled per stream by the "High Quality Audio" setting. When the client doesn't send the setting, the build-time default from `MOONLIGHT_HIGH_AUDIO_BITRATE_THRESHOLD` (kbps, default `0` = always high quality) applies.
 
 ### Crate: Moonlight Web Server
 This is the web server for Moonlight Web found at `moonlight-web/web-server/`.
