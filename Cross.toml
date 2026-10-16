@@ -1,5 +1,8 @@
 [build]
 dockerfile = "./Cross/Dockerfile"
 
+[build.env]
+passthrough = ["MOONLIGHT_HIGH_AUDIO_BITRATE_THRESHOLD"]
+
 [target.x86_64-pc-windows-gnu]
 dockerfile = "./Cross/Dockerfile.x86_64-pc-windows-gnu"

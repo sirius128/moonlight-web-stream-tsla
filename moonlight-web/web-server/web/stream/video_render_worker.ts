@@ -29,6 +29,13 @@ export type WorkerStatsMessage = {
     srcMinGapMs: number
     srcAvgGapMs: number
     srcMaxGapMs: number
+    /** canvas draw buffer, last frame, and the size the frame is drawn at (px) */
+    bufferWidth: number
+    bufferHeight: number
+    frameWidth: number
+    frameHeight: number
+    drawWidth: number
+    drawHeight: number
 }
 
 let canvas: OffscreenCanvas | null = null
@@ -40,6 +47,19 @@ let drawWidth = 0
 let drawHeight = 0
 let offsetX = 0
 let offsetY = 0
+// Frame size at the last layout pass; a change triggers a relayout
+let lastFrameWidth = 0
+let lastFrameHeight = 0
+// Canvas box size in device pixels, as reported by the main thread
+let targetWidth = 1
+let targetHeight = 1
+// A frame this close to the target in both dimensions is copied 1:1 and the
+// buffer resized to match, rather than resampled by a pixel or two.
+const SNAP_PX = 2
+// Scratch surface used only in non-stretch (letterbox/pillarbox) mode with the
+// bitmap renderer — see startBitmapCreationIfIdle() for why this is needed.
+let letterboxCanvas: OffscreenCanvas | null = null
+let letterboxCtx: OffscreenCanvasRenderingContext2D | null = null
 const workerSelf = self as any
 
 // Active reader when the ReadableStream has been transferred to this worker.
@@ -171,6 +191,16 @@ function scheduleFrame(frame: VideoFrame) {
     }
 }
 
+/** (Re)creates the letterbox scratch canvas if it doesn't match the current
+ * output size. Returns null if a 2D context couldn't be obtained. */
+function ensureLetterboxCanvas(width: number, height: number): OffscreenCanvasRenderingContext2D | null {
+    if (!letterboxCanvas || letterboxCanvas.width !== width || letterboxCanvas.height !== height) {
+        letterboxCanvas = new OffscreenCanvas(width, height)
+        letterboxCtx = letterboxCanvas.getContext("2d", { alpha: false })
+    }
+    return letterboxCtx
+}
+
 /** Starts createImageBitmap() for pendingRawFrame if nothing's already in
  * flight. Called on arrival AND right after the previous call resolves, so
  * decode/resize work stays maximally overlapped with network/vsync timing
@@ -179,15 +209,56 @@ function startBitmapCreationIfIdle() {
     if (bitmapCreationInFlight || !pendingRawFrame || !bitmapCtx || !canvas) return
     const frame = pendingRawFrame
     pendingRawFrame = null
-    if (drawWidth === 0 || drawHeight === 0) {
+    if (needsLayout(frame)) {
         recalcForFrame(frame)
     }
     bitmapCreationInFlight = true
-    createImageBitmap(frame, {
-        resizeWidth: drawWidth,
-        resizeHeight: drawHeight,
-        resizeQuality: "low",
-    }).then((bitmap) => {
+
+    if (offsetX !== 0 || offsetY !== 0) {
+        // Non-stretch (letterbox/pillarbox): transferFromImageBitmap() always
+        // presents its bitmap as the entire canvas — it has no independent x/y
+        // placement — so a bitmap resized down to drawWidth/drawHeight alone
+        // would just get stretched back out to fill the canvas, destroying the
+        // aspect ratio we just computed. Composite the frame onto a
+        // full-canvas-sized scratch surface at (offsetX, offsetY) first so the
+        // padding bars are baked into the bitmap itself.
+        const lctx = ensureLetterboxCanvas(canvas.width, canvas.height)
+        if (!lctx || !letterboxCanvas) {
+            frame.close()
+            bitmapCreationInFlight = false
+            startBitmapCreationIfIdle()
+            return
+        }
+        lctx.clearRect(0, 0, letterboxCanvas.width, letterboxCanvas.height)
+        lctx.drawImage(frame, offsetX, offsetY, drawWidth, drawHeight)
+        frame.close()
+        createImageBitmap(letterboxCanvas).then((bitmap) => {
+            bitmapCreationInFlight = false
+            if (!canvas) {
+                bitmap.close()
+                return
+            }
+            if (pendingBitmap) {
+                pendingBitmap.close()
+                workerDropped++
+            }
+            pendingBitmap = bitmap
+            startBitmapCreationIfIdle()
+        }).catch(() => {
+            bitmapCreationInFlight = false
+            startBitmapCreationIfIdle()
+        })
+        return
+    }
+
+    const bitmapPromise = frame.displayWidth === drawWidth && frame.displayHeight === drawHeight
+        ? createImageBitmap(frame)
+        : createImageBitmap(frame, {
+            resizeWidth: drawWidth,
+            resizeHeight: drawHeight,
+            resizeQuality: "low",
+        })
+    bitmapPromise.then((bitmap) => {
         frame.close()
         bitmapCreationInFlight = false
         if (!canvas) {
@@ -267,6 +338,7 @@ const statsMsg: WorkerStatsMessage = {
     type: "stats", drawn: 0, dropped: 0, arrived: 0,
     minGapMs: -1, avgGapMs: -1, maxGapMs: -1,
     srcMinGapMs: -1, srcAvgGapMs: -1, srcMaxGapMs: -1,
+    bufferWidth: 0, bufferHeight: 0, frameWidth: 0, frameHeight: 0, drawWidth: 0, drawHeight: 0,
 }
 
 // Post stats back to main thread every 2s (matches overlay refresh; reduces GC pressure)
@@ -281,6 +353,12 @@ setInterval(() => {
     statsMsg.srcMinGapMs = srcGapCount > 0 ? srcGapMin : -1
     statsMsg.srcAvgGapMs = srcGapCount > 0 ? srcGapSum / srcGapCount : -1
     statsMsg.srcMaxGapMs = srcGapCount > 0 ? srcGapMax : -1
+    statsMsg.bufferWidth = canvas?.width ?? 0
+    statsMsg.bufferHeight = canvas?.height ?? 0
+    statsMsg.frameWidth = lastFrameWidth
+    statsMsg.frameHeight = lastFrameHeight
+    statsMsg.drawWidth = drawWidth
+    statsMsg.drawHeight = drawHeight
     workerSelf.postMessage(statsMsg)
     // Reset interval accumulators
     arrivalCount = 0
@@ -288,13 +366,36 @@ setInterval(() => {
     srcGapMin = Infinity; srcGapMax = -Infinity; srcGapSum = 0; srcGapCount = 0
 }, 2000)
 
+function needsLayout(frame: VideoFrame): boolean {
+    return drawWidth === 0 || drawHeight === 0 ||
+        frame.displayWidth !== lastFrameWidth || frame.displayHeight !== lastFrameHeight
+}
+
+// canvas.width/canvas.height track the canvas box in device pixels (targetWidth/
+// targetHeight, set by the "init" and "resize" messages) — never the frame's own
+// resolution. Sizing it to the frame makes canvasAspect equal frameAspect by
+// construction, so the letterbox offsets always come out as 0. The one exception
+// is a frame within SNAP_PX of the target (native resolution rounded to even
+// values for the encoder): the buffer takes the frame's size so the frame is
+// copied 1:1 instead of being resampled by a pixel.
 function recalcForFrame(frame: VideoFrame) {
     if (!canvas) return
+
+    let bufferWidth = targetWidth
+    let bufferHeight = targetHeight
+    if (Math.abs(frame.displayWidth - bufferWidth) <= SNAP_PX && Math.abs(frame.displayHeight - bufferHeight) <= SNAP_PX) {
+        bufferWidth = frame.displayWidth
+        bufferHeight = frame.displayHeight
+    }
+    if (canvas.width !== bufferWidth) canvas.width = bufferWidth
+    if (canvas.height !== bufferHeight) canvas.height = bufferHeight
 
     const safeHeight = Math.max(1, canvas.height)
     const safeDisplayHeight = Math.max(1, frame.displayHeight)
     const canvasAspect = canvas.width / safeHeight
     const frameAspect = frame.displayWidth / safeDisplayHeight
+    lastFrameWidth = frame.displayWidth
+    lastFrameHeight = frame.displayHeight
 
     offsetX = 0
     offsetY = 0
@@ -303,12 +404,6 @@ function recalcForFrame(frame: VideoFrame) {
         drawWidth = canvas.width
         drawHeight = canvas.height
         return
-    }
-
-    // Keep source resolution in non-stretch mode.
-    if (drawWidth === 0 || drawHeight === 0) {
-        canvas.width = frame.displayWidth
-        canvas.height = frame.displayHeight
     }
 
     if (canvasAspect > frameAspect) {
@@ -328,7 +423,7 @@ function drawFrame(frame: VideoFrame) {
         return
     }
 
-    if (drawWidth === 0 || drawHeight === 0) {
+    if (needsLayout(frame)) {
         recalcForFrame(frame)
     }
 
@@ -355,8 +450,10 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
     if (data.type === "init") {
         canvas = data.canvas
         stretchToFit = data.stretchToFit
-        canvas.width = Math.max(1, data.width)
-        canvas.height = Math.max(1, data.height)
+        targetWidth = Math.max(1, data.width)
+        targetHeight = Math.max(1, data.height)
+        canvas.width = targetWidth
+        canvas.height = targetHeight
         drawWidth = 0
         drawHeight = 0
         offsetX = 0
@@ -378,19 +475,14 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
 
     if (data.type === "resize") {
         if (!canvas) return
-        if (stretchToFit) {
-            canvas.width = Math.max(1, data.width)
-            canvas.height = Math.max(1, data.height)
-            drawWidth = canvas.width
-            drawHeight = canvas.height
-            offsetX = 0
-            offsetY = 0
-        } else {
-            drawWidth = 0
-            drawHeight = 0
-            offsetX = 0
-            offsetY = 0
-        }
+        // The buffer is resized on the next frame by recalcForFrame(), which
+        // also needs that frame's size to decide whether to snap to it.
+        targetWidth = Math.max(1, data.width)
+        targetHeight = Math.max(1, data.height)
+        drawWidth = 0
+        drawHeight = 0
+        offsetX = 0
+        offsetY = 0
         return
     }
 
@@ -432,6 +524,8 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
         lastArrivedTimestamp = -1
         canvas = null
         ctx = null
+        letterboxCanvas = null
+        letterboxCtx = null
     }
 
     if (data.type === "enable-stats") { statsEnabled = true }

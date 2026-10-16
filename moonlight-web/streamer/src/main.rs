@@ -1045,6 +1045,14 @@ impl StreamConnection {
             })
             .await;
 
+        if let Some(enabled) = self.settings.high_quality_audio
+            && !self.moonlight.set_high_quality_audio(enabled)
+        {
+            warn!(
+                "[Stream] high quality audio setting ignored: moonlight-common-c was not built from the patched source"
+            );
+        }
+
         let mut host = self.info.host.lock().await;
 
         let gamepads = self.input.active_gamepads.read().await;

@@ -1,6 +1,7 @@
 import { Stream, StreamAudioDiagnostics } from "../stream/index.js"
 import { FreezeWatcher } from "../stream/freeze_watch.js"
 import { InputDiagnostics } from "../stream/input.js"
+import { RenderGeometry } from "../stream/canvas.js"
 import { Component } from "./index.js"
 
 type WorkerDiagnosticsSnapshot = {
@@ -29,9 +30,15 @@ type WorkerDiagnosticsSnapshot = {
         drawOnArrival?: boolean
         usingBitmapRenderer?: boolean
         videoElementMode?: boolean
+        geometry?: RenderGeometry
     } | null
     canvasRendererEnabled: boolean
     workersAllowedBySettings: boolean
+    display: {
+        devicePixelRatio: number
+        cssWidth: number
+        cssHeight: number
+    }
 }
 
 export class StreamStatsOverlay implements Component {
@@ -56,6 +63,7 @@ export class StreamStatsOverlay implements Component {
 
     // Cached DOM elements for fast updates (avoid querySelector each tick)
     private elVideoRes = document.createElement("span")
+    private elDisplay = document.createElement("span")
     private elCodec = document.createElement("span")
     private elFps = document.createElement("span")
     private elBitrate = document.createElement("span")
@@ -167,6 +175,7 @@ export class StreamStatsOverlay implements Component {
 
         const rows: Array<[string, HTMLSpanElement]> = [
             ["Resolution", this.elVideoRes],
+            ["Display", this.elDisplay],
             ["Codec", this.elCodec],
             ["FPS", this.elFps],
             ["Video Bitrate", this.elBitrate],
@@ -210,6 +219,23 @@ export class StreamStatsOverlay implements Component {
         }
 
         this.statRows = rows
+    }
+
+    /** e.g. "DPR 1.50, box 1280×720 css = 1920×1080 dev, frame 1920×1080 → draw 1280×720 (scaled), buffer 1280×720 → screen (scaled)"
+     * — both "same" means the picture reaches the panel dot-by-dot. */
+    private static formatDisplay(display: WorkerDiagnosticsSnapshot["display"], geometry?: RenderGeometry): string {
+        const dpr = display.devicePixelRatio
+        const devW = Math.round(display.cssWidth * dpr)
+        const devH = Math.round(display.cssHeight * dpr)
+        let text = `DPR ${dpr.toFixed(2)}, box ${display.cssWidth}×${display.cssHeight} css = ${devW}×${devH} dev`
+        if (geometry && geometry.frameWidth > 0) {
+            const g = geometry
+            const drawSame = g.frameWidth === Math.round(g.drawWidth) && g.frameHeight === Math.round(g.drawHeight)
+            const screenSame = g.bufferWidth === devW && g.bufferHeight === devH
+            text += `, frame ${g.frameWidth}×${g.frameHeight} → draw ${Math.round(g.drawWidth)}×${Math.round(g.drawHeight)} (${drawSame ? "same" : "scaled"})` +
+                `, buffer ${g.bufferWidth}×${g.bufferHeight} → screen (${screenSame ? "same" : "scaled"})`
+        }
+        return text
     }
 
     setPeerGetter(getter: () => RTCPeerConnection | null) {
@@ -592,6 +618,10 @@ export class StreamStatsOverlay implements Component {
             this.elAudioBuffer.textContent = "—"
             this.elAudioPipeline.textContent = "—"
         }
+
+        this.elDisplay.textContent = workerDiag
+            ? StreamStatsOverlay.formatDisplay(workerDiag.display, workerDiag.canvasRendererEnabled ? workerDiag.canvas?.geometry : undefined)
+            : "—"
 
         if (workerDiag) {
             if (workerDiag.stream) {

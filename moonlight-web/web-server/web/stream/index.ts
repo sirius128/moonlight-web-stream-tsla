@@ -83,10 +83,18 @@ export function getStreamerSize(settings: StreamSettings, viewerScreenSize: [num
         width = settings.videoSizeCustom.width
         height = settings.videoSizeCustom.height
     } else { // native
-        width = viewerScreenSize[0]
-        height = viewerScreenSize[1]
+        // viewerScreenSize is in CSS pixels, which are scaled by the OS/browser
+        // zoom; request the physical pixel count so the picture maps 1:1 to the
+        // panel. Rounded down to even values, which video encoders require.
+        const dpr = window.devicePixelRatio || 1
+        width = toEvenPixels(viewerScreenSize[0] * dpr)
+        height = toEvenPixels(viewerScreenSize[1] * dpr)
     }
     return [width, height]
+}
+
+function toEvenPixels(value: number): number {
+    return Math.max(2, Math.floor(Math.round(value) / 2) * 2)
 }
 
 export class Stream {
@@ -211,6 +219,7 @@ export class Stream {
                 video_colorspace: "Rec709", // TODO <---
                 video_color_range_full: true, // TODO <---
                 video_fec: this.settings.videoFec,
+                high_quality_audio: this.settings.highQualityAudio,
             }
         }
 

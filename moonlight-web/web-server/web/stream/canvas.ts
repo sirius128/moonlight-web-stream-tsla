@@ -3,6 +3,20 @@ declare class MediaStreamTrackProcessor {
     readonly readable: ReadableStream<VideoFrame>
 }
 
+// A frame this close to the draw buffer in both dimensions is copied 1:1 and
+// the buffer resized to match, rather than resampled by a pixel or two.
+const SNAP_PX = 2
+
+/** Sizes in pixels along the decode→draw path; 0 = not known yet. */
+export type RenderGeometry = {
+    bufferWidth: number
+    bufferHeight: number
+    frameWidth: number
+    frameHeight: number
+    drawWidth: number
+    drawHeight: number
+}
+
 export class CanvasRenderer {
     canvas: HTMLCanvasElement | null
     ctx: CanvasRenderingContext2D | null
@@ -30,6 +44,7 @@ export class CanvasRenderer {
     private workerInitError: string | null = null
     private stretchToFit: boolean
     private handleResize: () => void
+    private resizeObserver: ResizeObserver | null = null
 
     // Hidden video element renderer: uses browser's native frame timing
     private hiddenVideo: HTMLVideoElement | null = null
@@ -64,36 +79,68 @@ export class CanvasRenderer {
         this.handleResize = () => {
             if (!this.canvas) return
             if (this.workerRenderingEnabled && this.renderWorker) {
-                this.renderWorker.postMessage({
-                    type: "resize",
-                    width: Math.max(1, this.canvas.clientWidth),
-                    height: Math.max(1, this.canvas.clientHeight),
-                })
+                const [width, height] = this.targetBufferSize()
+                this.renderWorker.postMessage({ type: "resize", width, height })
                 return
             }
 
-            if (this.useVideoElementSource) {
-                // Reset layout so it recalculates on next draw
-                this.drawWidth = 0
-                this.drawHeight = 0
-                return
-            }
-
-            if (this.stretchToFit) {
-                const w = this.canvas.clientWidth
-                const h = this.canvas.clientHeight
-                this.resizeDrawTarget(w, h)
-                this.drawWidth = w
-                this.drawHeight = h
-                this.offsetX = 0
-                this.offsetY = 0
-            } else {
-                // For non-stretch mode we need the next video frame to recalc sizes
-                this.drawWidth = 0
-                this.drawHeight = 0
-            }
+            // Relayout against the new size on the next frame (the buffer
+            // size depends on the frame size too — see onFirstFrameAfterResize)
+            this.drawWidth = 0
+            this.drawHeight = 0
         }
         window.addEventListener("resize", this.handleResize)
+        // Belt-and-suspenders alongside the window "resize" listener above:
+        // covers layout changes that resize the canvas's CSS box without
+        // firing a window resize event (e.g. embedded-browser viewport
+        // quirks). handleResize() is idempotent/cheap to call redundantly.
+        // device-pixel-content-box gives the exact device pixel size the
+        // compositor uses (no rounding guesswork) and also fires when only
+        // the device pixel ratio changes.
+        this.resizeObserver = new ResizeObserver((entries) => {
+            const box = entries[entries.length - 1]?.devicePixelContentBoxSize?.[0]
+            if (box) {
+                this.devicePixelBoxSize = [Math.round(box.inlineSize), Math.round(box.blockSize)]
+            }
+            this.handleResize()
+        })
+        try {
+            this.resizeObserver.observe(this.canvas, { box: "device-pixel-content-box" })
+        } catch (_e) {
+            this.resizeObserver.observe(this.canvas)
+        }
+        this.watchDevicePixelRatio()
+    }
+
+    // Exact device pixel size of the canvas box from ResizeObserver, when the
+    // browser supports device-pixel-content-box
+    private devicePixelBoxSize: [number, number] | null = null
+    private dprQuery: MediaQueryList | null = null
+    // Needed when device-pixel-content-box is unsupported; where it is
+    // supported the ResizeObserver also fires and refreshes the exact size.
+    private onDevicePixelRatioChange = () => {
+        this.watchDevicePixelRatio()
+        this.handleResize()
+    }
+
+    // A resolution media query only matches one DPR, so re-arm it on change.
+    private watchDevicePixelRatio() {
+        this.dprQuery?.removeEventListener("change", this.onDevicePixelRatioChange)
+        this.dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`)
+        this.dprQuery.addEventListener("change", this.onDevicePixelRatioChange)
+    }
+
+    /** Draw buffer size in device pixels, so one buffer pixel maps to one
+     * panel pixel instead of being upscaled by the compositor. */
+    private targetBufferSize(): [number, number] {
+        if (this.devicePixelBoxSize) {
+            return [Math.max(1, this.devicePixelBoxSize[0]), Math.max(1, this.devicePixelBoxSize[1])]
+        }
+        const dpr = window.devicePixelRatio || 1
+        return [
+            Math.max(1, Math.round((this.canvas?.clientWidth ?? 0) * dpr)),
+            Math.max(1, Math.round((this.canvas?.clientHeight ?? 0) * dpr)),
+        ]
     }
 
     private trySetupRenderWorker() {
@@ -124,14 +171,23 @@ export class CanvasRenderer {
                     this.workerMinGapMs          = event.data.minGapMs
                     this.workerAvgGapMs          = event.data.avgGapMs
                     this.workerMaxGapMs          = event.data.maxGapMs
+                    this.workerGeometry = {
+                        bufferWidth:  event.data.bufferWidth,
+                        bufferHeight: event.data.bufferHeight,
+                        frameWidth:   event.data.frameWidth,
+                        frameHeight:  event.data.frameHeight,
+                        drawWidth:    event.data.drawWidth,
+                        drawHeight:   event.data.drawHeight,
+                    }
                 }
             }
+            const [width, height] = this.targetBufferSize()
             this.renderWorker.postMessage({
                 type: "init",
                 canvas: offscreen,
                 stretchToFit: this.stretchToFit,
-                width: Math.max(1, this.canvas.clientWidth),
-                height: Math.max(1, this.canvas.clientHeight),
+                width,
+                height,
             }, [offscreen as any])
             if (this.statsEnabledDesired) {
                 this.renderWorker.postMessage({ type: 'enable-stats' })
@@ -192,6 +248,18 @@ export class CanvasRenderer {
             drawOnArrival:   this.drawOnArrival,
             usingBitmapRenderer: this.bitmapCtx != null,
             videoElementMode: isVideoElementActive,
+            geometry: isWorkerActive ? this.workerGeometry : this.mainGeometry(),
+        }
+    }
+
+    private mainGeometry(): RenderGeometry {
+        return {
+            bufferWidth:  this.offscreenCanvas?.width ?? this.canvas?.width ?? 0,
+            bufferHeight: this.offscreenCanvas?.height ?? this.canvas?.height ?? 0,
+            frameWidth:   this.lastFrameWidth,
+            frameHeight:  this.lastFrameHeight,
+            drawWidth:    this.drawWidth,
+            drawHeight:   this.drawHeight,
         }
     }
 
@@ -516,7 +584,7 @@ export class CanvasRenderer {
         const frame = this.latestFrame
         if (!frame || this.latestFrameDrawn) return
 
-        if (this.drawWidth === 0) {
+        if (this.drawWidth === 0 || frame.displayWidth !== this.lastFrameWidth || frame.displayHeight !== this.lastFrameHeight) {
             this.onFirstFrameAfterResize(frame)
         }
 
@@ -573,10 +641,13 @@ export class CanvasRenderer {
      * latestFrame and picked up either by the retry below or the next caller
      * — never captured by a second concurrent createImageBitmap call.
      *
-     * Known limitation (matches the worker path): no offsetX/offsetY
-     * compositing — transferFromImageBitmap always fills the whole canvas, so
-     * letterbox/pillarbox positioning isn't applied here. Fine under the
-     * default stretchToFit=true where offsets are always 0.
+     * Non-stretch (letterbox/pillarbox): transferFromImageBitmap() always
+     * presents its bitmap as the entire canvas — it has no independent x/y
+     * placement — so a bitmap resized down to drawWidth/drawHeight alone
+     * would just get stretched back out to fill the canvas. In that case the
+     * frame is first composited onto a full-canvas-sized scratch surface at
+     * (offsetX, offsetY) so the padding bars are baked into the bitmap
+     * itself; see ensureLetterboxCanvas().
      */
     private drawStoredFrameBitmap(frame: VideoFrame) {
         if (!this.bitmapCtx) {
@@ -603,11 +674,38 @@ export class CanvasRenderer {
             // a frame that arrived while this one was in flight.
             this.drawStoredFrame()
         }
-        createImageBitmap(frame, {
-            resizeWidth: this.drawWidth,
-            resizeHeight: this.drawHeight,
-            resizeQuality: "low",
-        }).then((bitmap) => {
+
+        if (this.offsetX !== 0 || this.offsetY !== 0) {
+            const canvasWidth = this.offscreenCanvas ? this.offscreenCanvas.width : (this.canvas?.width ?? 0)
+            const canvasHeight = this.offscreenCanvas ? this.offscreenCanvas.height : (this.canvas?.height ?? 0)
+            const lctx = this.ensureLetterboxCanvas(canvasWidth, canvasHeight)
+            if (!lctx || !this.letterboxCanvas) {
+                frame.close()
+                settle()
+                return
+            }
+            lctx.clearRect(0, 0, canvasWidth, canvasHeight)
+            lctx.drawImage(frame, this.offsetX, this.offsetY, this.drawWidth, this.drawHeight)
+            frame.close()
+            createImageBitmap(this.letterboxCanvas).then((bitmap) => {
+                this.bitmapCtx?.transferFromImageBitmap(bitmap)
+                bitmap.close()
+                this.recordDrawCompletion(arrivedAt)
+                settle()
+            }).catch(() => {
+                settle()
+            })
+            return
+        }
+
+        const bitmapPromise = frame.displayWidth === this.drawWidth && frame.displayHeight === this.drawHeight
+            ? createImageBitmap(frame)
+            : createImageBitmap(frame, {
+                resizeWidth: this.drawWidth,
+                resizeHeight: this.drawHeight,
+                resizeQuality: "low",
+            })
+        bitmapPromise.then((bitmap) => {
             this.bitmapCtx?.transferFromImageBitmap(bitmap)
             bitmap.close()
             frame.close()
@@ -617,6 +715,19 @@ export class CanvasRenderer {
             frame.close()
             settle()
         })
+    }
+
+    // Scratch surface used only in non-stretch (letterbox/pillarbox) mode
+    // with the bitmap renderer — see drawStoredFrameBitmap() for why.
+    private letterboxCanvas: OffscreenCanvas | null = null
+    private letterboxCtx: OffscreenCanvasRenderingContext2D | null = null
+
+    private ensureLetterboxCanvas(width: number, height: number): OffscreenCanvasRenderingContext2D | null {
+        if (!this.letterboxCanvas || this.letterboxCanvas.width !== width || this.letterboxCanvas.height !== height) {
+            this.letterboxCanvas = new OffscreenCanvas(width, height)
+            this.letterboxCtx = this.letterboxCanvas.getContext("2d", { alpha: false })
+        }
+        return this.letterboxCtx
     }
 
     /** Arrival→draw latency + inter-draw gap bookkeeping. */
@@ -674,6 +785,12 @@ export class CanvasRenderer {
     private workerMinGapMs: number = -1;
     private workerAvgGapMs: number = -1;
     private workerMaxGapMs: number = -1;
+    private workerGeometry: RenderGeometry = {
+        bufferWidth: 0, bufferHeight: 0, frameWidth: 0, frameHeight: 0, drawWidth: 0, drawHeight: 0,
+    };
+    // Frame size seen by the main-thread path at its last layout pass
+    private lastFrameWidth: number = 0;
+    private lastFrameHeight: number = 0;
     // Last state requested via setStatsEnabled(), replayed once the worker
     // actually exists — the stats overlay's initial show() typically fires
     // before startRendering() has created renderWorker, so a plain postMessage
@@ -703,40 +820,43 @@ export class CanvasRenderer {
         }
     }
 
+    // draw target (canvas.width/height, or the offscreen equivalent) tracks
+    // the canvas box in device pixels (targetBufferSize), never the frame's
+    // own resolution — in both stretch and non-stretch mode. Sizing it to the
+    // frame makes canvasAspect equal frameAspect by construction, so the
+    // letterbox offsets always come out as 0. The one exception is a frame
+    // within SNAP_PX of the box (native resolution rounded to even values for
+    // the encoder): the buffer takes the frame's size so the frame is copied
+    // 1:1 instead of being resampled by a pixel.
     public onFirstFrameAfterResize(frame: VideoFrame) {
         if(!this.canvas) return
-        // Calculate aspect ratios
-        const canvasAspect = this.canvas.clientWidth / this.canvas.clientHeight
+        let [w, h] = this.targetBufferSize()
+        if (Math.abs(frame.displayWidth - w) <= SNAP_PX && Math.abs(frame.displayHeight - h) <= SNAP_PX) {
+            w = frame.displayWidth
+            h = frame.displayHeight
+        }
+        const canvasAspect = w / h
         const frameAspect = frame.displayWidth / frame.displayHeight
+        this.lastFrameWidth = frame.displayWidth
+        this.lastFrameHeight = frame.displayHeight
 
-        // Reset offsets to avoid stale values from a previous layout
+        this.resizeDrawTarget(w, h)
         this.offsetX = 0
         this.offsetY = 0
 
         if (this.stretchToFit) {
-            const w = this.canvas.clientWidth
-            const h = this.canvas.clientHeight
-            this.resizeDrawTarget(w, h)
             this.drawWidth = w
             this.drawHeight = h
-            this.offsetX = 0
-            this.offsetY = 0
+        } else if (canvasAspect > frameAspect) {
+            // Canvas is wider than the video frame, so the video will be pillarboxed.
+            this.drawHeight = h
+            this.drawWidth = this.drawHeight * frameAspect
+            this.offsetX = (w - this.drawWidth) / 2
         } else {
-            const w = frame.displayWidth
-            const h = frame.displayHeight
-            this.resizeDrawTarget(w, h)
-
-            if (canvasAspect > frameAspect) {
-                // Canvas is wider than the video frame, so the video will be pillarboxed.
-                this.drawHeight = h
-                this.drawWidth = this.drawHeight * frameAspect
-                this.offsetX = (w - this.drawWidth) / 2
-            } else {
-                // Canvas is taller than the video frame, so the video will be letterboxed.
-                this.drawWidth = w
-                this.drawHeight = this.drawWidth / frameAspect
-                this.offsetY = (h - this.drawHeight) / 2
-            }
+            // Canvas is taller than the video frame, so the video will be letterboxed.
+            this.drawWidth = w
+            this.drawHeight = this.drawWidth / frameAspect
+            this.offsetY = (h - this.drawHeight) / 2
         }
     }
 
@@ -774,6 +894,12 @@ export class CanvasRenderer {
         if (this.handleResize) {
             window.removeEventListener("resize", this.handleResize)
         }
+        if (this.resizeObserver) {
+            this.resizeObserver.disconnect()
+            this.resizeObserver = null
+        }
+        this.dprQuery?.removeEventListener("change", this.onDevicePixelRatioChange)
+        this.dprQuery = null
         if (this.hiddenVideo) {
             this.hiddenVideo.pause()
             this.hiddenVideo.srcObject = null
@@ -784,5 +910,7 @@ export class CanvasRenderer {
         this.ctx = null
         this.bitmapCtx = null
         this.offscreenCanvas = null
+        this.letterboxCanvas = null
+        this.letterboxCtx = null
     }
 }

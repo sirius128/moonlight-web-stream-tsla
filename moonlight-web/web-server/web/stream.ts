@@ -231,10 +231,17 @@ class ViewerApp implements Component {
 
         // Invalidate cached stream rect on resize
         window.addEventListener("resize", () => { this.cachedStreamRect = null })
-        // Also invalidate when the video element itself resizes (e.g. when the video
-        // stream starts and its intrinsic dimensions become known, causing the element
-        // to reflow from its initial min-width/min-height square into the correct ratio)
+        // Also invalidate when the video/canvas element itself resizes (e.g. when the
+        // video stream starts and its intrinsic dimensions become known, causing the
+        // element to reflow from its initial min-width/min-height square into the
+        // correct ratio). Both elements are observed regardless of canvasRenderer mode
+        // — observing an unmounted element is harmless and this keeps the cache correct
+        // whichever surface is actually being displayed. Missing the canvas observer
+        // here was the cause of touch/click positions drifting from the picture after a
+        // viewport change in canvas-renderer mode: getStreamRect() reads
+        // canvasElement's box, but only videoElement's resizes invalidated the cache.
         new ResizeObserver(() => { this.cachedStreamRect = null }).observe(this.videoElement)
+        new ResizeObserver(() => { this.cachedStreamRect = null }).observe(this.canvasElement)
 
         // Drive the on-screen-keyboard viewport adjustment. Upstream polls this
         // from a permanent rAF loop; visualViewport events are the actual signal
@@ -526,6 +533,11 @@ class ViewerApp implements Component {
             canvas: this.canvasRenderer?.getWorkerDiagnostics() ?? null,
             canvasRendererEnabled: this.settings.canvasRenderer,
             workersAllowedBySettings: this.settings.useVideoWorker,
+            display: {
+                devicePixelRatio: window.devicePixelRatio || 1,
+                cssWidth: this.getElement().clientWidth,
+                cssHeight: this.getElement().clientHeight,
+            },
         }
     }
 

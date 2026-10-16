@@ -258,6 +258,11 @@ pub enum StreamClientMessage {
         /// default keeps auth messages from older (cached) clients parseable.
         #[serde(default = "video_fec_default")]
         video_fec: bool,
+        /// Request high quality audio regardless of video bitrate. Absent
+        /// (older cached clients) keeps the streamer's build-time default.
+        #[serde(default)]
+        #[ts(optional)]
+        high_quality_audio: Option<bool>,
     },
     /// Attach as an input-only (keyboard/mouse/touch/controller) client to an
     /// already-running stream for `host_id`, instead of starting a new one.
